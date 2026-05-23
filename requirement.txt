@@ -1,0 +1,5 @@
+djitellopy
+opencv-python==4.12.0.88
+matplotlib
+pygame
+numpy
