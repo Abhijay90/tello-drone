@@ -16,7 +16,7 @@ print(me.get_battery())
 me.streamon()
 
 me.takeoff()
-# sleep(2)
+sleep(2)
 
 # me.send_rc_control(0,0,30,0) # go high to see face
 
@@ -32,7 +32,7 @@ while True:
 		img=me.get_frame_read().frame
 	img=cv2.resize(img,(w,h))
 	img,info= findFace(img)
-	trackface(me,info,w,pid,pError)
+	# trackface(me,info,w,pid,pError)
 	# print("center",info[0],"Area",info[1]) #get the tracking face 
 	cv2.imshow("output",img)
 	if cv2.waitKey(1) & 0xFF == ord('q'):
