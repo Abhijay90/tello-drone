@@ -35,14 +35,18 @@ def _draw_connections(img, landmarks, img_w, img_h):
         cv2.line(img, p1, p2, (0, 255, 0), 2)
 
 
-def findPalm(img):
-    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) #this line reduced accuracy looks like data from drone reduces info when converted. possbily
-    img_rgb = img
+def findPalm(img,from_drone):
+    if from_drone:
+        img_rgb = img
+    else:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) #this line reduced accuracy looks like data from drone reduces info when converted. possbily
+    
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
     detection_result = mp_hands.detect(mp_image)
 
     cx, cy, area = 0, 0, 0
     bx, by, bw, bh = 0, 0, 0, 0
+    landmarks = None
 
     if detection_result.hand_landmarks and len(detection_result.hand_landmarks) > 0:
         landmarks = detection_result.hand_landmarks[0]
@@ -63,4 +67,4 @@ def findPalm(img):
         cv2.putText(img, "NO HAND", (img.shape[1] // 2 - 60, 60),
                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-    return img, [cx, cy, area]
+    return img, [cx, cy, area, landmarks]
