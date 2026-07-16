@@ -1,294 +1,385 @@
-# palm gesture flight control using hand landmark detection + vision.gestures_v2 engine
-from djitellopy import tello
-from time import sleep, time, perf_counter
-from vision.palmtracker import findPalm
-from vision.gestures_v2 import Gesture, classify_and_debug, DEADZONE_CENTER, DEADZONE_WIDTH
-import cv2
+# Real-time webcam gesture classifier test with confusion matrix tracking
+# Tests all 8 gesture types against live camera feed, showing per-class accuracy.
+# Uses MediaPipe HandLandmarker directly (same approach as gesture_webcam_test.py)
+
 import sys
+sys.path.insert(0, '/home/abhikun/Desktop/drone/tello-drone')
+
+import time
 import os
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from vision.gestures_v2 import classify, Gesture, _MODEL_AVAILABLE
+from gesture_rc_mapping import GESTURE_RC_MAP, HOVER_COMMAND
 
-DEBUG_DIR = "debug_frames"
-os.makedirs(DEBUG_DIR, exist_ok=True)
-_proof_count = 0
-_prev_gesture = Gesture.UNKNOWN
-_prev_classify_time = 0.0  # last classify() call time
+# === DRONE/WEBCAM MODE TOGGLE ===
+DRONE_MODE = True  # Set True for real drone, False for webcam debug
 
-# ============== CONSTANTS ================
+if DRONE_MODE:
+    from djitellopy import tello
+    from time import sleep
 
-# Display
-RES_W, RES_H = 960, 720
-WINDOW_NAME = "Palm Flight"
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17), (5, 17),
+]
 
-# Detection targets
-TARGET_AREA = 4000
-TARGET_X = RES_W // 2
-
-# Gesture-to-RC speed mapping: (speed_y, speed_z)
-# Y axis = forward/backward (positive=closer to palm, negative=farther)
-# Z axis = up/down (positive=away=up, negative=toward=back)
-# Base scales: y_scale=35 px/s (speed=1→35), z_scale=0.4 m/s (speed=1→0.4 m/s)
-GESTURE_RC = {
-    Gesture.OPEN_PALM:   (0, 0),
-    Gesture.CLOSED_FIST: (0, 0),
-    Gesture.THUMBS_UP:   (0, 1),
-    Gesture.THUMBS_DOWN: (0, -1),
-    Gesture.PALM_UP:     (0, 0),
-    Gesture.PALM_DOWN:   (0, 0),
-    Gesture.PALM_LEFT:   (-1, 0),
-    Gesture.PALM_RIGHT:  (1, 0),
-    Gesture.UNKNOWN:     (0, 0)
+GESTURE_COLORS = {
+    Gesture.OPEN_PALM: (0, 255, 0),
+    Gesture.CLOSED_FIST: (0, 0, 255),
+    Gesture.THUMBS_UP: (255, 0, 0),
+    Gesture.THUMBS_DOWN: (255, 255, 0),
+    Gesture.PALM_UP: (0, 255, 255),
+    Gesture.PALM_DOWN: (255, 0, 255),
+    Gesture.PALM_LEFT: (128, 0, 128),
+    Gesture.PALM_RIGHT: (0, 128, 128),
+    Gesture.UNKNOWN: (128, 128, 128),
 }
 
-# Gesture-to-overlay labels: (arrow, command_text)
-GESTURE_CMD = {
-    Gesture.OPEN_PALM:   ("\u2299", "HOVER"),
-    Gesture.CLOSED_FIST: ("\u2299", "HOVER"),
-    Gesture.THUMBS_UP:   ("\u2191", "UP"),
-    Gesture.THUMBS_DOWN: ("\u2193", "DOWN"),
-    Gesture.PALM_UP:     ("\u2299", "HOVER"),
-    Gesture.PALM_DOWN:   ("\u2299", "HOVER"),
-    Gesture.PALM_LEFT:   ("\u2190", "LEFT"),
-    Gesture.PALM_RIGHT:  ("\u2192", "RIGHT"),
-    Gesture.UNKNOWN:     ("\u25cb", "NO TRACK")
-}
+VALID_GESTURES = [
+    Gesture.OPEN_PALM, Gesture.CLOSED_FIST,
+    Gesture.THUMBS_UP, Gesture.THUMBS_DOWN,
+    Gesture.PALM_UP, Gesture.PALM_DOWN,
+    Gesture.PALM_LEFT, Gesture.PALM_RIGHT,
+]
 
-# Display constants
-OVERLAY_FONT = cv2.FONT_HERSHEY_SIMPLEX
-OVERLAY_SCALE_GESTURE = 0.7
-OVERLAY_SCALE_INFO = 0.5
-OVERLAY_THICKNESS = 2
-OVERLAY_THICKNESS_THIN = 1
-COLOR_GREEN = (0, 255, 0)
-COLOR_WHITE = (255, 255, 255)
-COLOR_YELLOW = (255, 255, 0)
-COLOR_RED = (0, 0, 255)
-COLOR_CYAN = (255, 255, 0)
-
-# Position constants (x, y) for overlay text layers
-POS_GESTURE = (20, 30)
-POS_CMD = (20, 60)
-POS_SPEED = (10, 90)
-POS_MODE = (10, 110)
-
-# Drone settings
-DEFAULT_WEBCAM_IDX = 0
-LAND_WAIT_SEC = 2
-EXIT_WAIT_SEC = 1
-
-# PID state (kept for compatibility)
-ZERO_PID = (0, 0)
-
-# Gesture classification debounce: minimum time between classify() calls (seconds)
-CLASSIFY_DEBOUNCE_SEC = 0.5
-
-# Motion modes: toggled with 'm' key
-MOTION_MODE_DEPLOY = "deploy"      # Hand position (left/right of center) controls direction
-MOTION_MODE_CLASSIFY = "classify"   # Discrete gesture recognition (thumbs, palms, etc.)
-
-# Motion mode constants
-MOTION_MODE_DEADZONE = "deadzone"   # Hovering within deadzone in deploy mode
-MOTION_MODE_DIR = "dir"             # Directional control based on hand placement
-MOTION_MODE_CLASSIFY_GESTURE = "gesture"  # Gesture classification state
-
-# Deploy deadzone threshold in pixels (from center)
-# Below this: deadzone (hover). Above this: directional (PALM_LEFT/PALM_RIGHT)
-DEPLOY_DEADZONE_PX = 30
+gesture_correct = {}
+gesture_total = {}
+hover_pid = None
+prev_centroid = None
+centroid_smooth_alpha = 0.3
 
 
-# ============= HELPER FUNCTIONS =============
+def reset_stats():
+    global gesture_correct, gesture_total
+    gesture_correct = {g: 0 for g in VALID_GESTURES}
+    gesture_total = {g: 0 for g in VALID_GESTURES}
 
-def gesture_to_rc(gesture):
-    """Get (speed_y, speed_z) from a gesture."""
-    return GESTURE_RC.get(gesture, (0, 0))
+def update_stats(prediction, actual):
+    if actual in gesture_correct:
+        gesture_total[actual] += 1
+        if prediction == actual:
+            gesture_correct[actual] += 1
+
+def draw_stats(frame):
+    w = frame.shape[1]
+    x, y, ww, hh = w - 290, 10, 280, 240
+    cv2.rectangle(frame, (x, y), (x + ww, y + hh), (0, 0, 0), cv2.FILLED)
+    cv2.rectangle(frame, (x, y), (x + ww, y + hh), (100, 100, 100), 1)
+    cv2.putText(frame, "ACCURACY PER GESTURE:", (x + 10, y + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    oy = 50
+    for gesture in VALID_GESTURES:
+        t = gesture_total[gesture]
+        c = gesture_correct[gesture]
+        acc = (c / t * 100) if t > 0 else 0
+        color = (0, 255, 0) if acc >= 90 else (255, 255, 0) if acc >= 60 else (0, 255, 255)
+        cv2.putText(frame, f"{gesture.name:<13s}: {acc:5.1f}% ({c}/{t})",
+                    (x + 10, y + oy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        oy += 22
+    total = sum(gesture_total.values())
+    ov = sum(gesture_correct.values()) / total * 100 if total > 0 else 0
+    cv2.putText(frame, f"OVERALL   : {ov:5.1f}% ({sum(gesture_correct.values())}/{total})",
+                (x + 10, y + hh - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+def overlay_prediction(frame, prediction):
+    x, y = 10, 10
+    color = GESTURE_COLORS.get(prediction, (128, 128, 128))
+    cv2.rectangle(frame, (x - 10, y - 10), (x + 180, y + 35), (0, 0, 0), cv2.FILLED)
+    cv2.rectangle(frame, (x - 10, y - 10), (x + 180, y + 35), color, 2)
+    cv2.putText(frame, f"Gesture: {prediction.name}",
+                (x, y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    cv2.putText(frame, "SVM MODEL" if _MODEL_AVAILABLE else "HEURISTIC MODE",
+                (x, y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+def draw_landmarks(frame, hand_landmarks):
+    if not hand_landmarks:
+        return
+    for i, j in HAND_CONNECTIONS:
+        if i < len(hand_landmarks[0]) and j < len(hand_landmarks[0]):
+            pt1 = (int(hand_landmarks[0][i].x * frame.shape[1]), int(hand_landmarks[0][i].y * frame.shape[0]))
+            pt2 = (int(hand_landmarks[0][j].x * frame.shape[1]), int(hand_landmarks[0][j].y * frame.shape[0]))
+            cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
+    for i in range(min(21, len(hand_landmarks[0]))):
+        pt = (int(hand_landmarks[0][i].x * frame.shape[1]), int(hand_landmarks[0][i].y * frame.shape[0]))
+        cv2.circle(frame, pt, 5, (255, 0, 0), -1)
+
+def get_hand_centroid(landmarks):
+    """Return (cx, cy) normalized [0,1] from 21 hand landmarks."""
+    xs = [landmarks[i].x for i in range(21)]
+    ys = [landmarks[i].y for i in range(21)]
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
-def gesture_to_cmd_text(gesture):
-    """Get (arrow, command) labels from a gesture."""
-    return GESTURE_CMD.get(gesture, ("\u25cb", "UNKNOWN"))
+def compute_ground_truth(hand_landmarks, w_px, h_px):
+    if not hand_landmarks:
+        return Gesture.UNKNOWN
+    lm = hand_landmarks[0]
+    pts = [(lm[i].x * w_px, lm[i].y * h_px) for i in range(21)]
+    thumb_ext = pts[4][1] < pts[2][1]
+    fingers_ext = pts[8][1] < pts[6][1] and pts[12][1] < pts[10][1]
+    if thumb_ext and not fingers_ext:
+        thumb_offset = pts[4][0] - pts[1][0]
+        return Gesture.THUMBS_DOWN if thumb_offset < -20 else Gesture.THUMBS_UP
+    elif thumb_ext and fingers_ext:
+        return Gesture.OPEN_PALM
+    elif not thumb_ext and not fingers_ext:
+        return Gesture.CLOSED_FIST
+    else:
+        return Gesture.OPEN_PALM
 
-
-def draw_overlays(img, gesture, speed_y, speed_z, mode, sub_mode=None):
-    """Draw gesture overlay info on frame. Returns the modified image."""
-    arrow, cmd = gesture_to_cmd_text(gesture)
-
-    # Gesture line
-    cv2.putText(img, f"Gesture: {gesture}", POS_GESTURE,
-                OVERLAY_FONT, OVERLAY_SCALE_GESTURE, COLOR_GREEN, OVERLAY_THICKNESS)
-    cv2.putText(img, f"{arrow} {cmd}", POS_CMD,
-                OVERLAY_FONT, OVERLAY_SCALE_GESTURE, COLOR_WHITE, OVERLAY_THICKNESS)
-
-    # Speed line
-    cv2.putText(img, f"speed_y:{speed_y} speed_z:{speed_z}", POS_SPEED,
-                OVERLAY_FONT, OVERLAY_SCALE_INFO, COLOR_WHITE, OVERLAY_THICKNESS_THIN)
-
-    # Mode line - show sub_mode if provided
-    mode_text = mode if sub_mode is None else f"{mode} ({sub_mode})"
-    cv2.putText(img, f"[{mode_text} MODE]", POS_MODE,
-                OVERLAY_FONT, OVERLAY_SCALE_INFO, COLOR_YELLOW, OVERLAY_THICKNESS_THIN)
-
-    return img
-
-
-def send_rc(me, y, z):
-    """Send RC only if in drone mode and armed."""
-    if DRONE_MODE and me:
-        me.send_rc_control(0, int(y), int(z), 0)
-
-
-def get_frame(me, cap):
-    """Get next frame from drone stream or webcam."""
-    if DRONE_MODE and me:
-        return me.get_frame_read().frame
-    elif cap is not None:
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            return frame
-    return None
-
-
-# ============= STATE =============
-
-DRONE_MODE = False
-CURRENT_MOTION_MODE = MOTION_MODE_DEPLOY  # start in deploy mode (default)
-
-
-# ============= INIT =============
-
-def init_device():
-    """Initialize either Tello drone or webcam. Returns (me_or_none, cap_or_none)."""
-    me = None
-    cap = None
-
+def main():
+    print("\n" + "=" * 60)
+    print("GESTURE CLASSIFIER - REAL-TIME TEST")
+    print("=" * 60)
     if DRONE_MODE:
+        print("Mode: DRONE FPV")
         me = tello.Tello()
         me.connect()
         print(f"Battery: {me.get_battery()}%")
         me.streamon()
-        print("Taking off...")
-        # me.takeoff()
-        print("Drone ready \u2014 start gesturing!")
+        me.takeoff()
+
+        print("Drone ready — start gesturing!\n")
+
+        # Gesture-to-RC mapping variables
+        last_rc_command = (0, 0, 0, 0)
+        gesture_stable_gesture = None
+        debounce_counter = 0
+        DEBOUNCE_FRAMES = 3
+
+
+        # Phase 3.1: hover stabilization globals
+        global hover_pid, prev_centroid
+        hover_pid = type('HoverPID', (), {
+            'kp': 15.0, 'kd': 8.0, 'ki': 0.0,
+            'drift_threshold': 0.02, 'max_output': 20.0,
+            'prev_err_x': 0.0, 'prev_err_y': 0.0, 'prev_time': time.time(),
+        })()
+        prev_centroid = None
+
+        # Hover/stabilization variables
+        gesture_log_file = open('/home/abhikun/Desktop/drone/tello-drone/pid_hover_log.txt', 'a')
+        gesture_log_file.write(f"{'Timestamp':<22} {'Altitude (cm)':<16} {'VGX':<8} {'VGY':<8} {'Gesture':<16} {'RC Command':<16}\n")
+        gesture_log_file.flush()
+        last_log_time = time.time()
+        LOG_INTERVAL = 2  # seconds
+
     else:
-        print("[webcam debug mode \u2014 no drone commands]")
-        cap = cv2.VideoCapture(DEFAULT_WEBCAM_IDX)
+        print("Mode: WEBCAM")
+        print("Key Bindings:  q=Quit  h=Help  c=Clear stats\n")
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            print(f"Cannot open webcam index {DEFAULT_WEBCAM_IDX}")
+            print("Error: Could not open webcam")
             sys.exit(1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        webcam_cap = cap
 
-        for i in range(1, 5):  # test 4 frames to be sure
-            ret, frame = cap.read()
-            if ret and frame is not None and frame.size > 0:
-                print(f"  Frame {i}: OK")
-            else:
-                print(f"  Frame {i}: failed")
-                cap.release()
-                sys.exit(1)
-        print("Webcam OK \u2014 starting flight loop...")
-
-    return me, cap
-
-
-me, cap = init_device()
-prev_error_y, prev_error_z = ZERO_PID
-print(f"Started in MOTION_MODE={CURRENT_MOTION_MODE}")
+    model_path = '/home/abhikun/Desktop/drone/tello-drone/models/hand_landmarker.task'
+    base_options = python.BaseOptions(model_asset_path=model_path)
+    detector = vision.HandLandmarker.create_from_options(
+        vision.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            num_hands=2,
+        )
+    )
 
 
-# ============= MAIN LOOP =============
+    reset_stats()
+    frame_count = 0
 
-try:
-    while True:
-        img = get_frame(me, cap)
-        if img is None:
-            print("no image received")
-            continue
-
-        img = cv2.resize(img, (RES_W, RES_H))
-        img, info = findPalm(img, DRONE_MODE)
-        cx, cy, area, landmarks = info
-
-        error_y = error_z = 0
-        gesture = Gesture.UNKNOWN
-        speed_y = speed_z = 0
-        mode = "WEBCAM"
-        if DRONE_MODE:
-            mode = "DRONE"
-
-        sub_mode = None  # Will be set based on motion mode
-
-        if cx == 0 or area == 0 or landmarks is None:
-            # No hand detected
-            gesture = Gesture.UNKNOWN
-            speed_y, speed_z = gesture_to_rc(gesture)
-            sub_mode = "no_hand"
-        elif CURRENT_MOTION_MODE == MOTION_MODE_DEPLOY:
-            # === Deploy Mode: Hand X position controls direction ===
-            # Deadzone logic: if hand is near center, hover; otherwise directional
-            if cx < TARGET_X - DEPLOY_DEADZONE_PX:
-                gesture = Gesture.PALM_LEFT
-                speed_y, speed_z = gesture_to_rc(gesture)
-                sub_mode = MOTION_MODE_DEADZONE  # Left side
-            elif cx > TARGET_X + DEPLOY_DEADZONE_PX:
-                gesture = Gesture.PALM_RIGHT
-                speed_y, speed_z = gesture_to_rc(gesture)
-                sub_mode = MOTION_MODE_DIR  # Right side
-            else:
-                # Within deadzone: hover
-                gesture = Gesture.UNKNOWN
-                speed_y, speed_z = 0, 0
-                sub_mode = MOTION_MODE_DEADZONE
-        elif CURRENT_MOTION_MODE == MOTION_MODE_CLASSIFY:
-            # === Classify Mode: Recognize discrete gestures ===
-            gesture = classify_and_debug(landmarks, img.shape[1], img.shape[0])
-            speed_y, speed_z = gesture_to_rc(gesture)
-            sub_mode = MOTION_MODE_CLASSIFY_GESTURE
-
-        img = draw_overlays(img, gesture, speed_y, speed_z, mode, sub_mode=sub_mode)
-
-        if DRONE_MODE:
-            send_rc(me, int(speed_y), int(speed_z))
-
-        cv2.imshow(WINDOW_NAME, img)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('q'):
-            print("Landing...")
-            break
-        elif key == ord('t'):
-            print("Toggling mode...")
+    try:
+        while True:
+            h_px, w_px = 0, 0
+            frame = None
+            
             if DRONE_MODE:
-                if me:
-                    me.land()
-                    sleep(LAND_WAIT_SEC)
-                DRONE_MODE = False
-                print("Switched to WEBCAM MODE")
-                # Release drone resources
-                if me:
-                    del me
-                    me = None
+                rgb_frame = me.get_frame_read().frame
+                if rgb_frame is None:
+                    continue
+                frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+                frame=cv2.flip(frame,1)
+                h_px, w_px = frame.shape[:2]
             else:
-                me = tello.Tello()
-                me.connect()
-                print(f"Battery: {me.get_battery()}%")
-                me.streamon()
-                # me.takeoff()
-                print("Drone ready \u2014 start gesturing!")
-                DRONE_MODE = True
-                print("Switched to DRONE MODE")
-        elif key == ord('m'):
-            # Toggle motion mode between deploy and classify
-            CURRENT_MOTION_MODE = MOTION_MODE_CLASSIFY if CURRENT_MOTION_MODE == MOTION_MODE_DEPLOY else MOTION_MODE_DEPLOY
-            print(f"MOTION_MODE switched to {CURRENT_MOTION_MODE}")
+                ret, frame = webcam_cap.read()
+                if not ret or frame is None:
+                    continue
+                w_px = frame.shape[1]
+                h_px = frame.shape[0]
+                frame = cv2.flip(frame, 1)
 
-        prev_error_y, prev_error_z = error_y, error_z
+            frame_count += 1
+            
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            detection_results = detector.detect(img)
 
-except KeyboardInterrupt:
-    print("Interrupted by user")
-finally:
-    if DRONE_MODE and 'me' in locals() and me is not None:
-        # me.land()
-        sleep(EXIT_WAIT_SEC)
-        me.streamoff()
-    elif 'cap' in locals() and cap is not None and not cap.empty():
-        cap.release()
-        cap = None
-    cv2.destroyAllWindows()
-    print("Exit complete.")
+            draw_landmarks(frame, detection_results.hand_landmarks)
+
+            if detection_results.hand_landmarks and len(detection_results.hand_landmarks) > 0:
+                prediction = classify(
+                    detection_results.hand_landmarks[0], w_px, h_px
+                )
+                actual = compute_ground_truth(detection_results.hand_landmarks, w_px, h_px)
+                update_stats(prediction, actual)
+            else:
+                prediction = Gesture.UNKNOWN
+                actual = Gesture.UNKNOWN
+
+
+            # Gesture stabilization with debounce (runs every frame)
+            if DRONE_MODE:
+                if detection_results.hand_landmarks and prediction != Gesture.UNKNOWN:
+                    if gesture_stable_gesture is None or gesture_stable_gesture != prediction:
+                        gesture_stable_gesture = prediction
+                        debounce_counter = 0
+                        print(f"GESTURE CHANGED: {prediction.name} (debouncing...)")
+                    else:
+                        debounce_counter += 1
+                        if debounce_counter == DEBOUNCE_FRAMES:
+                            print(f"Gesture STABLE: {gesture_stable_gesture.name} -> ready for RC commands")
+                else:
+                    gesture_stable_gesture = None
+                    debounce_counter = 0
+
+            # Gesture-to-RC command mapping with Phase 3.1 hover stabilization
+            if DRONE_MODE:
+                if gesture_stable_gesture is not None and debounce_counter >= DEBOUNCE_FRAMES:
+                    print("sending command on basis of gesutre")
+                    base_cmd = GESTURE_RC_MAP.get(gesture_stable_gesture.name, HOVER_COMMAND)
+                    hover_sent = False
+
+                    if gesture_stable_gesture == Gesture.CLOSED_FIST and detection_results.hand_landmarks:
+                        lm = detection_results.hand_landmarks[0]
+                        raw_cx, raw_cy = get_hand_centroid(lm)
+
+                        if prev_centroid is not None:
+                            raw_cx = centroid_smooth_alpha * raw_cx + (1 - centroid_smooth_alpha) * prev_centroid[0]
+                            raw_cy = centroid_smooth_alpha * raw_cy + (1 - centroid_smooth_alpha) * prev_centroid[1]
+                        prev_centroid = (raw_cx, raw_cy)
+
+                        now = time.time()
+                        dt = max(now - hover_pid.prev_time, 0.001)
+                        hover_pid.prev_time = now
+
+                        err_x = raw_cx - 0.5
+                        err_y = raw_cy - 0.5
+                        d_err_x = (err_x - hover_pid.prev_err_x) / dt
+                        d_err_y = (err_y - hover_pid.prev_err_y) / dt
+                        hover_pid.prev_err_x = err_x
+                        hover_pid.prev_err_y = err_y
+
+                        corr_roll = hover_pid.kp * err_x + hover_pid.kd * d_err_x
+                        corr_yaw = 0
+
+                        if abs(err_x) >= hover_pid.drift_threshold or abs(err_y) >= hover_pid.drift_threshold:
+                            corr_roll = int(np.clip(corr_roll, -20, 20))
+                            corr_yaw = int(np.clip(corr_yaw, -20, 20))
+                            if corr_roll != 0 or corr_yaw != 0:
+                                print(f"Hover PID: centroid=({raw_cx:.3f},{raw_cy:.3f}) -> corr=({corr_roll},{corr_yaw})")
+                                hover_sent = True
+                        else:
+                            hover_pid.prev_err_x = hover_pid.prev_err_y = 0.0
+                            corr_roll = 0
+                            corr_yaw = 0
+
+                        base_cmd = (corr_roll, base_cmd[1], base_cmd[2], corr_yaw)
+
+                    rc_cmd = base_cmd
+                    if rc_cmd != last_rc_command:
+                        print(f"Gesture was {gesture_stable_gesture.name}")
+                        print(f"sending rc command {rc_cmd}" )
+                        me.send_rc_control(*rc_cmd)
+                        last_rc_command = rc_cmd
+                        if not hover_sent:
+                            print(f"Gesture {gesture_stable_gesture.name} -> RC {rc_cmd}")
+                else:
+                    # No stable gesture detected — force hover
+                    if last_rc_command != HOVER_COMMAND:
+                        me.send_rc_control(*HOVER_COMMAND)
+                        print(f"Gesture lost, sending hover command (last was {last_rc_command})")
+                        last_rc_command = HOVER_COMMAND
+
+            # Periodic height + gesture logging (every LOG_INTERVAL seconds)
+            if DRONE_MODE:
+                now = time.time()
+                if now - last_log_time >= LOG_INTERVAL:
+                    last_log_time = now
+                    try:
+                        state = me.get_current_state()
+                        altitude = state.get('h', -1) if state else -1
+                        vgx = str(state.get('vgx', -1)) if state else '-1'
+                        vgy = str(state.get('vgy', -1)) if state else '-1'
+                    except Exception:
+                        altitude = -1
+                        vgx = '-1'
+                        vgy = '-1'
+                    current_gesture = gesture_stable_gesture.name if gesture_stable_gesture else "NONE"
+                    log_line = f"{now:<16.3f} {altitude:<10} {vgx:<8} {vgy:<8} {current_gesture:<16} {last_rc_command}\n"
+                    if gesture_log_file:
+                        gesture_log_file.write(log_line)
+                        gesture_log_file.flush()
+                    
+                    # Print state to console
+                    print(f"[STATE] Time={now:.3f} Alt={altitude}cm Vgx={vgx} Vgy={vgy} G={current_gesture}")
+
+            overlay_prediction(frame, prediction)
+            if frame_count % 30 == 0:
+                draw_stats(frame)
+
+            cv2.imshow('Gesture Detector', frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('c') and not DRONE_MODE:
+                reset_stats()
+                print("Statistics cleared.")
+            elif key == ord('h'):
+                print("\nKey Bindings: q=Quit  h=Help  c=Clear(only webcam)")
+            elif key == ord('t') and not DRONE_MODE:
+                print("Toggle DRONE_MODE: edit file line 13")
+
+    finally:
+
+
+        if DRONE_MODE:
+            me.land()
+            sleep(2)
+            me.streamoff()
+            me.end()
+        elif not DRONE_MODE:
+            webcam_cap.release()
+        cv2.destroyAllWindows()
+
+        print("\n" + "=" * 60)
+        print("FINAL ACCURACY SUMMARY")
+        print("=" * 60)
+        total = sum(gesture_total.values())
+        if total > 0:
+            overall = sum(gesture_correct.values()) / total * 100
+            print(f"\nOverall Accuracy: {overall:.1f}% ({sum(gesture_correct.values())}/{total} samples)")
+            print("\nPer-Gesture Accuracy:")
+            for g in VALID_GESTURES:
+                acc = (gesture_correct[g] / gesture_total[g] * 100) if gesture_total[g] > 0 else 0
+                mark = "OK" if acc >= 80 else ("WARN" if acc >= 50 else "LOW")
+                clr = "\033[92m" if acc >= 80 else "\033[93m" if acc >= 50 else "\033[91m"
+                print(f"  {g.name:<15s}: {acc:5.1f}% ({gesture_correct[g]}/{gesture_total[g]}) [{clr}{mark}\033[0m]")
+        else:
+            print("No samples collected. No hand detected in camera.")
+        print(f"\nSVM Model: {'LOADED' if _MODEL_AVAILABLE else 'NOT LOADED'}")
+        if not _MODEL_AVAILABLE:
+            print("  Run: cd training && python train_and_benchmark.py")
+        print(f"Total samples: {total}")
+        print("Exit complete.")
+
+if __name__ == '__main__':
+    main()

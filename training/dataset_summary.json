@@ -1,0 +1,16 @@
+{
+  "device": "webcam",
+  "total_samples": 29,
+  "gesture_counts": {
+    "open_palm": 0,
+    "closed_fist": 0,
+    "thumbs_up": 0,
+    "thumbs_down": 0,
+    "palm_up": 0,
+    "palm_down": 0,
+    "palm_left": 0,
+    "palm_right": 29
+  },
+  "data_dir": "/home/abhikun/Desktop/drone/tello-drone/data",
+  "timestamp": "2026-06-12T18:30:32.000925"
+}

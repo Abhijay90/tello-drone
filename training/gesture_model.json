@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "classifier_type": "heuristic",
+  "thumb_rules": {
+    "separation_beyond_ip": 0.35,
+    "description": "thumb tips must extend this fraction of palm width past IP joint to count as thumb_up or thumbs_down"
+  },
+  "orientation_rules": {
+    "finger_tap_ratio": 0.45,
+    "description": "tip-to-mcp distance / palm_diagonal ratio above which a finger counts as 'extended'; also the open/pinch detection threshold"
+  },
+  "orientation_rules_2": {
+    "palm_normal_z_threshold": 0.02,
+    "description": "cross-product z-value above which palm is 'UP', below which it is 'DOWN'"
+  },
+  "fist_rules": {
+    "spread_threshold": 80,
+    "min_pinch_threshold": 60,
+    "description": "pixel-based spread limit for 'closed fist' detection; below = closed, above = open"
+  },
+  "position_rules": {
+    "left_deadzone": 0.4,
+    "right_deadzone": 0.6,
+    "description": "normalized x-center thresholds for left/right palm detection"
+  }
+}

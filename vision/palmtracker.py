@@ -39,7 +39,8 @@ def findPalm(img,from_drone):
     if from_drone:
         img_rgb = img
     else:
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) #this line reduced accuracy looks like data from drone reduces info when converted. possbily
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_rgb = cv2.flip(img_rgb, 1)  # Mirror to match training data (data_collector.py:209)
     
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
     detection_result = mp_hands.detect(mp_image)

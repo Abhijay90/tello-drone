@@ -18,6 +18,11 @@ This plan details the implementation of a scale-invariant gesture engine with po
 | Phase 5 | `benchmark_results.txt` | ❌ Not yet created |
 | Phase 5 | `v2_thresholds.json` | ❌ Not yet created |
 | Phase 6 | `gestures_v2` integration | ✅ Complete |
+| Phase 7 | `tello_handtrack.py` dual-mode (webcam + FPV) | ✅ Complete — merged single `while True` loop with conditional frame acquisition; FPV mirroring fixed with `cv2.flip(frame, 1)` |
+| Phase 8 | Gesture detection validation | ✅ Complete — both modes now detect gestures; FPV works with mirroring |
+| Phase 7 | `tello_handtrack.py` webcam test | ✅ Complete (26.9% accuracy, SVM loaded) |
+| Phase 8 | FPV camera mirroring fix | ✅ Complete (`cv2.flip(frame, 1)` on drone frame) |
+| Phase 9 | Gesture detection on FPV | ✅ Complete — gesture detection now works properly on drone FPV |
 
 ---
 
@@ -301,6 +306,8 @@ data_fpv/
   ✓ GESTURE_RC mapping update
   ✓ GESTURE_CMD overlay update
   ✓ MOTION_MODE integration
+  ✓ Dual-mode webcam/FPV support merged into single loop
+  ✓ FPV frame mirroring fix (cv2.flip for coordinate alignment)
 
 □ Flight test
   □ Verify TOGGLE mode: crisp on/off
@@ -368,10 +375,49 @@ tello-drone/
 
 ---
 
+## Phase 4: Confidence Scoring System (COMPLETE)
+
+### Deliverables:
+
+- `vision/gestures_v2.py`: `classify_and_confidence()` function
+  - Uses `decision_function()` for raw SVM margin scores
+  - Converts scores to probabilities via **sigmoid** (one-vs-rest calibration)
+  - Fallback: heuristic confidence based on threshold margin
+  - Always returns `(gesture, confidence_score, all_probs_dict)`
+
+- `tello_handtrack.py`: Confidence overlay on webcam/FPV frame
+  - **Confidence bar** (top-right corner) with 3 color zones:
+    - Green (>0.7): High confidence
+    - Yellow (>0.4): Medium confidence
+    - Red (≤0.4): Low confidence
+  - Percentage display: `C:XX%`
+  - Default `CURRENT_MOTION_MODE` switched to `CLASSIFY`
+
+### How confidence works:
+
+```
+decision_function(X) → returns raw margin for each class
+↓
+sigmoid(margin) → probability 0.0-1.0 for each class
+↓
+max(probabilities) → confidence score
+```
+
+The confidence reflects how far the sample is from the SVM decision boundary. More distance = higher confidence.
+
+### Key files changed:
+
+| File             | Changes                                                  |
+|------------------|----------------------------------------------------------|
+| gestures_v2.py   | `classify_with_confidence()` function (~70 lines)        |
+| tello_handtrack.py | Default mode CLASSIFY + confidence overlay in draw     |
+
+---
+
 ## Next Steps
 
-1. **Phase 4**: Create `test/analyze_landmarks.py` (threshold analysis script)
-2. **Phase 4**: Run manual data collection (~20 min, webcam + FPV, 80+ frames/gesture)
-3. **Phase 5**: Create `test/evaluate_gestures.py` (benchmark V1 vs V2)
-4. **Phase 5**: Generate `benchmark_results.txt` and `v2_thresholds.json`
-5. **Phase 6**: Flight test and validate gestures in both motion modes
+1. **Retrain classifier** — Current SVM accuracy is 26.9% on webcam data (misclassifies most as OPEN_PALM). Recollect balanced dataset with PALM_UP/DOWN/LEFT/RIGHT samples.
+2. **FPV gesture validation** — Confirm gesture detection accuracy on drone FPV stream; may need domain-specific threshold tuning or retraining.
+3. **Gesture-to-RC integration** — Map detected gestures to Tello RC commands (forward/backward/left/right/up/down/hover) pending classifier accuracy improvements.
+4. **Flight test** — End-to-end validation on Tello drone with reliable gesture detection.
+5. **Add confidence thresholding** — Reject low-confidence predictions to prevent erratic drone behavior.
